@@ -109,6 +109,22 @@ mod common_parallel {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_uffd_rwp_anon() {
+        // Direct vmlinux boot (default kernel_path on Guest); the focal
+        // image's cloud-init brings SSH up.
+        let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
+        _test_uffd_rwp_anon(&guest);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_uffd_rwp_shmem() {
+        let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
+        _test_uffd_rwp_shmem(&guest);
+    }
+
+    #[test]
     fn test_multi_cpu() {
         let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
         _test_multi_cpu(&guest);

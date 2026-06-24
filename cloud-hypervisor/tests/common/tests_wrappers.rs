@@ -11,7 +11,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::string::String;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use std::{panic, ptr, thread};
 
@@ -3665,7 +3666,16 @@ fn recv_fds_with_body(stream: &UnixStream) -> (Vec<i32>, Vec<u8>) {
 const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
 const UFFDIO_API: u64 = 0xc018_aa3f;
 const UFFDIO_ZEROPAGE: u64 = 0xc020_aa04;
+const UFFDIO_RWPROTECT: u64 = 0xc018_aa09;
+const UFFDIO_SET_MODE: u64 = 0x4010_aa0a;
+const UFFDIO_RWPROTECT_MODE_RWP: u64 = 1;
 const UFFD_API_VERSION: u64 = 0xAA;
+const UFFD_PAGEFAULT_FLAG_RWP: u64 = 1 << 3;
+const UFFD_FEATURE_RWP: u64 = 1 << 17;
+const UFFD_FEATURE_RWP_ASYNC: u64 = 1 << 18;
+// PAGEMAP_SCAN category: a page accessed (read OR written) since the
+// last RWP arm. The RWP analog of PAGE_IS_WRITTEN (write-only).
+const PAGE_IS_ACCESSED: u64 = 1 << 9;
 const PAGEMAP_SCAN: u64 = 0xc060_6610;
 // Documented PAGEMAP_SCAN categories and flags (uapi/linux/fs.h).
 const PAGE_IS_WRITTEN: u64 = 1 << 1;
@@ -3678,6 +3688,27 @@ struct UffdioApi {
     api: u64,
     features: u64,
     ioctls: u64,
+}
+
+/// Probe the running kernel for UFFD_FEATURE_RWP. Both RWP tests
+/// register guest memory with UFFDIO_REGISTER_MODE_RWP, which the
+/// kernel rejects with EINVAL unless this feature is present, so the
+/// tests skip on kernels that predate it. Returns true iff
+/// the feature bit comes back set from UFFDIO_API.
+fn kernel_has_uffd_rwp() -> bool {
+    let fd =
+        unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK) } as i32;
+    if fd < 0 {
+        return false;
+    }
+    let mut api = UffdioApi {
+        api: UFFD_API_VERSION,
+        features: 0,
+        ioctls: 0,
+    };
+    let ret = unsafe { libc::ioctl(fd, UFFDIO_API as libc::Ioctl, &mut api) };
+    unsafe { libc::close(fd) };
+    ret == 0 && api.features & UFFD_FEATURE_RWP != 0
 }
 
 #[repr(C)]
@@ -3946,6 +3977,19 @@ pub(crate) fn _test_uffd_handoff(guest: &Guest) {
 }
 
 #[repr(C)]
+struct UffdioRwprotect {
+    range_start: u64,
+    range_len: u64,
+    mode: u64,
+}
+
+#[repr(C)]
+struct UffdioSetMode {
+    enable: u64,
+    disable: u64,
+}
+
+#[repr(C)]
 struct PmScanArg {
     size: u64,
     flags: u64,
@@ -3967,6 +4011,125 @@ struct PageRegion {
     start: u64,
     end: u64,
     categories: u64,
+}
+
+#[derive(Default)]
+struct FaultStats {
+    rwp_faults: AtomicU64,
+    missing_faults: AtomicU64,
+}
+
+/// Issue UFFDIO_RWPROTECT on `[addr, addr+len)`. `protect=true` marks
+/// the range PROT_NONE; `false` clears protection and wakes blocked
+/// threads.
+fn uffd_rwprotect(uffd_fd: i32, addr: u64, len: u64, protect: bool) -> io::Result<()> {
+    let mut rw = UffdioRwprotect {
+        range_start: addr,
+        range_len: len,
+        mode: if protect {
+            UFFDIO_RWPROTECT_MODE_RWP
+        } else {
+            0
+        },
+    };
+    let ret = unsafe { libc::ioctl(uffd_fd, UFFDIO_RWPROTECT as libc::Ioctl, &mut rw) };
+    if ret < 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Toggle uffd async-mode features at runtime (e.g. enable
+/// `UFFD_FEATURE_RWP_ASYNC` so RWP faults are resolved in-kernel and
+/// surface only as `PAGE_IS_ACCESSED` via PAGEMAP_SCAN).
+fn uffd_set_mode(uffd_fd: i32, enable: u64, disable: u64) -> io::Result<()> {
+    let sm = UffdioSetMode { enable, disable };
+    let ret = unsafe { libc::ioctl(uffd_fd, UFFDIO_SET_MODE as libc::Ioctl, &sm) };
+    if ret < 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Count pages accessed (read OR written) since the last RWP arm,
+/// via the `PAGE_IS_ACCESSED` PAGEMAP_SCAN category. The
+/// RWP analog of `pagemap_hot_pages` (which is write-only).
+fn pagemap_accessed_pages(pid: u32, start: u64, end: u64) -> io::Result<u64> {
+    pagemap_scan_count(pid, start, end, 0, PAGE_IS_ACCESSED, 0, 0, PAGE_IS_ACCESSED)
+}
+
+/// Drain pagefault messages from the uffd until `stop_fd` becomes
+/// readable (teardown signal) or the uffd reports POLLHUP. Resolves
+/// RWP faults by clearing protection on the faulting page (so the
+/// guest can proceed); resolves stray MISSING faults with
+/// UFFDIO_ZEROPAGE.
+#[allow(clippy::needless_pass_by_value)]
+fn run_rwp_fault_handler(uffd_fd: i32, stop_fd: i32, stats: Arc<FaultStats>) {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
+
+    loop {
+        let mut pfds = [
+            libc::pollfd {
+                fd: uffd_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stop_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, -1) };
+        if ret < 0 {
+            break;
+        }
+        if pfds[1].revents & libc::POLLIN != 0 {
+            break;
+        }
+        if pfds[0].revents & libc::POLLHUP != 0 {
+            break;
+        }
+        if pfds[0].revents & libc::POLLIN == 0 {
+            continue;
+        }
+
+        let mut msg = MaybeUninit::<UffdMsg>::uninit();
+        let n = unsafe {
+            libc::read(
+                uffd_fd,
+                msg.as_mut_ptr() as *mut libc::c_void,
+                mem::size_of::<UffdMsg>(),
+            )
+        };
+        if n != mem::size_of::<UffdMsg>() as isize {
+            break;
+        }
+        let msg = unsafe { msg.assume_init() };
+        if msg.event != UFFD_EVENT_PAGEFAULT {
+            continue;
+        }
+
+        let addr = msg.pf_address & !(page_size - 1);
+        if msg.pf_flags & UFFD_PAGEFAULT_FLAG_RWP != 0 {
+            // Clearing protection on the faulting page wakes the guest.
+            let _ = uffd_rwprotect(uffd_fd, addr, page_size, false);
+            stats.rwp_faults.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // Defensive: shouldn't happen on a fully-populated VM, but
+            // resolve so we don't deadlock the guest.
+            let mut zp = UffdioZeropage {
+                range_start: addr,
+                range_len: page_size,
+                mode: 0,
+                zeropage: 0,
+            };
+            unsafe {
+                libc::ioctl(uffd_fd, UFFDIO_ZEROPAGE as libc::Ioctl, &mut zp);
+            }
+            stats.missing_faults.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// One PAGEMAP_SCAN pass over `[start, end)` on `/proc/<pid>/pagemap`,
@@ -4082,8 +4245,8 @@ fn pagemap_hot_pages(pid: u32, start: u64, end: u64, rearm: bool) -> io::Result<
 
 /// Reclaimable set: the complement of the hot set among *resident*
 /// pages — present but *not active* since the last arm, where "active"
-/// is the hot category `PAGE_IS_WRITTEN` (the WP write-set). This is
-/// the page set a
+/// is the per-mode hot category (`PAGE_IS_WRITTEN` for WP write-set,
+/// `PAGE_IS_ACCESSED` for RWP access-set). This is the page set a
 /// memory manager would reclaim: track the hot set positively, then
 /// reclaim everything else. Unlike a positive "cold" classifier, this
 /// has no blind spot for pre-populated-but-unused pages (e.g. a
@@ -4115,6 +4278,234 @@ fn pagemap_hole_pages(pid: u32, start: u64, end: u64) -> io::Result<u64> {
 /// guest RAM actually survives the uffd-WP handoff as huge pages.
 fn pagemap_huge_pages(pid: u32, start: u64, end: u64) -> io::Result<u64> {
     pagemap_scan_count(pid, start, end, 0, PAGE_IS_HUGE, 0, 0, PAGE_IS_HUGE)
+}
+
+/// Runtime uffd attach + RWP validation. RWP is the
+/// *optional* read-aware hot signal layered over the WP path:
+/// it tracks *accesses* (reads and writes) via the
+/// `PAGE_IS_ACCESSED` PAGEMAP_SCAN category, catching read-only touches
+/// that WP's write-only `PAGE_IS_WRITTEN` misses. Under the
+/// hot-tracking model the manager records this access-set and reclaims
+/// its complement (present-and-not-accessed).
+///
+/// Boots a full VM (no uffd handoff in config), waits for SSH, attaches
+/// a manager via `/vm.uffd-attach` with `mode=RWP`, then exercises:
+///
+///   - synchronous RWP (`UFFDIO_RWPROTECT` → `UFFD_PAGEFAULT_FLAG_RWP`
+///     fault messages). Only run for `shared=false` (anon/private).
+///     RWP write-protect is a no-op on *huge shmem folios*: `RWPROTECT`
+///     splits the huge PMD, which on file/shmem erases it to `none`
+///     PTEs, and no marker is installed on `none` PTEs
+///     (only WP does, via `PTE_MARKER_UFFD_WP`) — see mm/mprotect.c.
+///     CH's shared guest RAM is shmem (memfd), huge-folio-backed by
+///     default (host `shmem_enabled=within_size`/`always`, independent
+///     of madvise), so sync RWP has nothing to trap. anon is immune
+///     (its huge PMD is marked in place, no split) and base-page shmem
+///     works too — it is purely folio size, not pre-present vs
+///     uffd-installed pages.
+///   - asynchronous RWP (`UFFDIO_SET_MODE(RWP_ASYNC)`): the kernel
+///     resolves faults itself (no messages) and records the access in
+///     `PAGE_IS_ACCESSED`, which the manager samples via PAGEMAP_SCAN.
+///
+/// THP coverage is opportunistic — the huge-page count is logged, not
+/// asserted, so the test is independent of the host/THP policy. The
+/// reclaimable (present but not accessed) count is likewise logged, not
+/// asserted: unlike WP's sparse write-set, a running guest reads across
+/// its whole working set quickly, so the RWP access-set can cover the
+/// entire resident set.
+#[allow(clippy::if_not_else)]
+fn run_uffd_rwp(guest: &Guest, shared: bool) {
+    use std::io::Write;
+
+    if !kernel_has_uffd_rwp() {
+        eprintln!(
+            "skipping RWP test: kernel lacks UFFD_FEATURE_RWP \
+             (RWP needs a kernel with UFFD_FEATURE_RWP)"
+        );
+        return;
+    }
+
+    let tag = if shared { "rwp/shmem" } else { "rwp/anon" };
+    let api_socket = temp_api_path(&guest.tmp_dir);
+    let handoff_sock_path = guest
+        .tmp_dir
+        .as_path()
+        .join("uffd-rwp.sock")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let mem = format!(
+        "size=512M,shared={},thp=on",
+        if shared { "on" } else { "off" }
+    );
+    let mut cmd = GuestCommand::new(guest);
+    cmd.default_cpus()
+        .args(["--memory", &mem])
+        .default_kernel_cmdline()
+        .default_disks()
+        .default_net()
+        .args(["--api-socket", &api_socket])
+        .args(["--serial", "tty", "--console", "off"])
+        .capture_output()
+        .enable_thp_in_child();
+    let mut child = cmd.spawn().unwrap();
+    let vmm_pid = child.id();
+
+    let r = panic::catch_unwind(|| {
+        eprintln!("[{tag}] waiting for VM boot");
+        guest.wait_vm_boot().unwrap();
+        eprintln!("[{tag}] VM booted");
+
+        // Bind the handoff socket, then trigger the attach API in the
+        // background — the call blocks on the handoff handshake.
+        let listener = UnixListener::bind(&handoff_sock_path).unwrap();
+        let api_sock_clone = api_socket.clone();
+        let handoff_sock_clone = handoff_sock_path.clone();
+        let attach_thread = thread::spawn(move || {
+            let body = serde_json::json!({
+                "handoff_socket": handoff_sock_clone,
+                "mode": "RWP",
+            })
+            .to_string();
+            let mut sock = UnixStream::connect(&api_sock_clone).unwrap();
+            api_client::simple_api_command(&mut sock, "PUT", "uffd-attach", Some(&body))
+        });
+
+        let (mut stream, _) = listener.accept().unwrap();
+        let (fds, body) = recv_fds_with_body(&stream);
+        let uffd_fd = fds[0];
+        for &extra in &fds[1..] {
+            unsafe { libc::close(extra) };
+        }
+        drop(listener);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("valid handoff JSON");
+        let regions = parsed["regions"].as_array().expect("regions array");
+        assert!(!regions.is_empty(), "handoff carried no regions");
+        let host_va = regions[0]["host_virt_addr"].as_u64().unwrap();
+        let region_size = regions[0]["size"].as_u64().unwrap();
+        let probe_start = host_va;
+        let probe_len = region_size;
+        let probe_end = probe_start + probe_len;
+
+        // Spawn the fault handler before ACKing so it's polling the
+        // moment CH unblocks.
+        let stats = Arc::new(FaultStats::default());
+        let handler_stats = Arc::clone(&stats);
+        let stop_fd = make_stop_fd();
+        let fault_handler =
+            thread::spawn(move || run_rwp_fault_handler(uffd_fd, stop_fd, handler_stats));
+
+        stream.write_all(b"A").unwrap();
+        drop(stream);
+        attach_thread
+            .join()
+            .unwrap()
+            .expect("uffd-attach API call failed");
+        eprintln!("[{tag}] attach API succeeded");
+
+        // THP coverage is opportunistic — log, don't assert.
+        let huge = pagemap_huge_pages(vmm_pid, probe_start, probe_end).expect("HUGE scan");
+        eprintln!("[{tag}] huge_pages={huge}");
+
+        // ===== Synchronous RWP (anon only) =====
+        if !shared {
+            eprintln!("[{tag}] applying sync RWP");
+            uffd_rwprotect(uffd_fd, probe_start, probe_len, true).expect("sync RWP failed");
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline && stats.rwp_faults.load(Ordering::Relaxed) == 0 {
+                thread::sleep(Duration::from_millis(50));
+            }
+            let sync_faults = stats.rwp_faults.load(Ordering::Relaxed);
+            let sync_missing = stats.missing_faults.load(Ordering::Relaxed);
+            uffd_rwprotect(uffd_fd, probe_start, probe_len, false).expect("sync RWP-clear failed");
+            eprintln!("[{tag}] sync_faults={sync_faults} missing_faults={sync_missing}");
+            assert!(
+                sync_faults > 0,
+                "expected sync RWP faults within 15s, got 0 \
+                 (missing_faults={sync_missing}, vmm_pid={vmm_pid})"
+            );
+            // Let the guest catch up before switching to async so the
+            // sync fault backlog isn't still draining when we re-protect.
+            thread::sleep(Duration::from_secs(1));
+        } else {
+            eprintln!(
+                "[{tag}] skipping sync RWP \
+                 (RWP no-ops on huge shmem folios; CH shared RAM is \
+                 huge-folio-backed by default — see mm/mprotect.c none-PTE gap)"
+            );
+        }
+
+        // ===== Async RWP + PAGE_IS_ACCESSED (anon + shmem) =====
+        eprintln!("[{tag}] switching to async RWP");
+        uffd_set_mode(uffd_fd, UFFD_FEATURE_RWP_ASYNC, 0).expect("UFFDIO_SET_MODE failed");
+        let baseline = stats.rwp_faults.load(Ordering::Relaxed);
+        uffd_rwprotect(uffd_fd, probe_start, probe_len, true).expect("async RWP failed");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut accessed = 0;
+        while Instant::now() < deadline {
+            accessed =
+                pagemap_accessed_pages(vmm_pid, probe_start, probe_end).expect("ACCESSED scan");
+            if accessed > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let async_delta = stats.rwp_faults.load(Ordering::Relaxed) - baseline;
+        // reclaimable (resident, not accessed) is the complement of the
+        // hot access-set, keyed on PAGE_IS_ACCESSED — logged, not
+        // asserted (a busy guest may touch its whole resident set
+        // within the window).
+        let reclaimable =
+            pagemap_reclaimable_pages(vmm_pid, probe_start, probe_end, PAGE_IS_ACCESSED)
+                .expect("reclaimable scan");
+        let hole = pagemap_hole_pages(vmm_pid, probe_start, probe_end).expect("hole scan");
+        uffd_rwprotect(uffd_fd, probe_start, probe_len, false).expect("async RWP-clear failed");
+        eprintln!(
+            "[{tag}] async_fault_delta={async_delta} accessed={accessed} \
+             reclaimable={reclaimable} hole={hole}"
+        );
+        assert_eq!(
+            async_delta, 0,
+            "async RWP delivered {async_delta} fault messages; expected 0 \
+             (kernel should resolve silently)"
+        );
+        assert!(
+            accessed > 0,
+            "async RWP: PAGE_IS_ACCESSED reported 0 accessed pages within 15s"
+        );
+        assert!(
+            hole > 0,
+            "async RWP: expected non-resident (hole) pages, got 0"
+        );
+
+        // Tear down. Signal-then-join-then-close so the handler never
+        // operates on a closed-and-possibly-recycled fd integer.
+        signal_stop(stop_fd);
+        fault_handler.join().unwrap();
+        unsafe { libc::close(uffd_fd) };
+        unsafe { libc::close(stop_fd) };
+        eprintln!("[{tag}] all phases ok, shutting down VM");
+
+        guest.ssh_command("sudo poweroff").unwrap();
+        thread::sleep(Duration::new(20, 0));
+    });
+
+    kill_child(&mut child);
+    let output = child.wait_with_output().unwrap();
+    handle_child_output(r, &output);
+}
+
+/// Synchronous + async RWP on anon/private guest RAM.
+pub(crate) fn _test_uffd_rwp_anon(guest: &Guest) {
+    run_uffd_rwp(guest, false);
+}
+
+/// Async RWP access-tracking (`PAGE_IS_ACCESSED`) on shmem guest RAM.
+/// Synchronous RWP is skipped — it is a no-op on huge shmem folios.
+pub(crate) fn _test_uffd_rwp_shmem(guest: &Guest) {
+    run_uffd_rwp(guest, true);
 }
 
 /// Validate the documented WP-async write-set-tracking interface end to

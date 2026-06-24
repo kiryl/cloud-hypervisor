@@ -37,24 +37,27 @@ const _: () = assert!(USERFAULTFD_IOC_NEW <= u32::MAX as u64);
 pub const UFFD_API: u64 = 0xAA;
 pub const UFFDIO_REGISTER_MODE_MISSING: u64 = 1 << 0;
 pub const UFFDIO_REGISTER_MODE_WP: u64 = 1 << 1;
+pub const UFFDIO_REGISTER_MODE_RWP: u64 = 1 << 3;
 pub const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
 pub const UFFD_FEATURE_MISSING_HUGETLBFS: u64 = 1 << 4;
 pub const UFFD_FEATURE_MISSING_SHMEM: u64 = 1 << 5;
 pub const UFFD_FEATURE_WP_HUGETLBFS_SHMEM: u64 = 1 << 6;
 pub const UFFD_FEATURE_WP_UNPOPULATED: u64 = 1 << 13;
 pub const UFFD_FEATURE_WP_ASYNC: u64 = 1 << 15;
+pub const UFFD_FEATURE_RWP: u64 = 1 << 17;
+pub const UFFD_FEATURE_RWP_ASYNC: u64 = 1 << 18;
 
 const _UFFDIO_COPY: u64 = 0x03;
 const _UFFDIO_WAKE: u64 = 0x02;
 pub const UFFD_API_RANGE_IOCTLS_BASIC: u64 = (1 << _UFFDIO_WAKE) | (1 << _UFFDIO_COPY);
 
-/// Parsed `MISSING|WP|WP_UNPOPULATED|WP_ASYNC`-style configuration
-/// spec for a single uffd handoff.
+/// Parsed `MISSING|WP|RWP|WP_UNPOPULATED|WP_ASYNC|RWP_ASYNC`-style
+/// configuration spec for a single uffd handoff.
 ///
 /// Two kernel surfaces are deliberately conflated into one user-facing
 /// token string:
-/// - register modes (MISSING, WP) → `UFFDIO_REGISTER` `mode` field
-/// - features (WP_UNPOPULATED, WP_ASYNC) → `UFFDIO_API`
+/// - register modes (MISSING, WP, RWP) → `UFFDIO_REGISTER` `mode` field
+/// - features (WP_UNPOPULATED, WP_ASYNC, RWP_ASYNC) → `UFFDIO_API`
 ///   `features` field
 ///
 /// They live in different ioctls and the async features are also
@@ -62,7 +65,7 @@ pub const UFFD_API_RANGE_IOCTLS_BASIC: u64 = (1 << _UFFDIO_WAKE) | (1 << _UFFDIO
 /// case they describe one decision (“how do I want this uffd
 /// configured?”), the token namespaces are disjoint, and the only
 /// features we accept here are the ones tightly coupled to the
-/// WP register mode — so a single spec is the ergonomic choice.
+/// WP/RWP register modes — so a single spec is the ergonomic choice.
 ///
 /// Stored as the parsed bits but serialised on the wire (CLI / JSON
 /// config / HTTP body) as the original token-string form, so config
@@ -79,10 +82,10 @@ pub struct UffdHandoffSpec {
 pub enum UffdHandoffSpecParseError {
     #[error(
         "unknown UFFD mode token '{0}' (expected one of \
-        MISSING, WP, WP_UNPOPULATED, WP_ASYNC)"
+        MISSING, WP, RWP, WP_UNPOPULATED, WP_ASYNC, RWP_ASYNC)"
     )]
     UnknownToken(String),
-    #[error("UFFD mode requires at least one register mode (MISSING, WP)")]
+    #[error("UFFD mode requires at least one register mode (MISSING, WP, RWP)")]
     NoRegisterMode,
     #[error("UFFD feature '{feature}' requires register mode '{requires}'")]
     FeatureRequiresRegisterMode {
@@ -102,8 +105,10 @@ impl UffdHandoffSpec {
             match token {
                 "MISSING" => register |= UFFDIO_REGISTER_MODE_MISSING,
                 "WP" => register |= UFFDIO_REGISTER_MODE_WP,
+                "RWP" => register |= UFFDIO_REGISTER_MODE_RWP,
                 "WP_UNPOPULATED" => features |= UFFD_FEATURE_WP_UNPOPULATED,
                 "WP_ASYNC" => features |= UFFD_FEATURE_WP_ASYNC,
+                "RWP_ASYNC" => features |= UFFD_FEATURE_RWP_ASYNC,
                 other => return Err(UffdHandoffSpecParseError::UnknownToken(other.into())),
             }
         }
@@ -127,6 +132,12 @@ impl UffdHandoffSpec {
                 requires: "WP",
             });
         }
+        if features & UFFD_FEATURE_RWP_ASYNC != 0 && register & UFFDIO_REGISTER_MODE_RWP == 0 {
+            return Err(UffdHandoffSpecParseError::FeatureRequiresRegisterMode {
+                feature: "RWP_ASYNC",
+                requires: "RWP",
+            });
+        }
         Ok(UffdHandoffSpec { register, features })
     }
 }
@@ -142,18 +153,24 @@ impl fmt::Display for UffdHandoffSpec {
     /// Canonical representation: tokens in fixed order joined by `|`.
     /// Round-trips through `parse` (modulo input ordering / whitespace).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut tokens: Vec<&str> = Vec::with_capacity(4);
+        let mut tokens: Vec<&str> = Vec::with_capacity(6);
         if self.register & UFFDIO_REGISTER_MODE_MISSING != 0 {
             tokens.push("MISSING");
         }
         if self.register & UFFDIO_REGISTER_MODE_WP != 0 {
             tokens.push("WP");
         }
+        if self.register & UFFDIO_REGISTER_MODE_RWP != 0 {
+            tokens.push("RWP");
+        }
         if self.features & UFFD_FEATURE_WP_UNPOPULATED != 0 {
             tokens.push("WP_UNPOPULATED");
         }
         if self.features & UFFD_FEATURE_WP_ASYNC != 0 {
             tokens.push("WP_ASYNC");
+        }
+        if self.features & UFFD_FEATURE_RWP_ASYNC != 0 {
+            tokens.push("RWP_ASYNC");
         }
         f.write_str(&tokens.join("|"))
     }
@@ -224,6 +241,13 @@ mod tests {
 
     #[test]
     fn parse_rejects_feature_without_register_mode() {
+        assert_eq!(
+            UffdHandoffSpec::parse("MISSING|RWP_ASYNC"),
+            Err(UffdHandoffSpecParseError::FeatureRequiresRegisterMode {
+                feature: "RWP_ASYNC",
+                requires: "RWP",
+            })
+        );
         assert_eq!(
             UffdHandoffSpec::parse("MISSING|WP_ASYNC"),
             Err(UffdHandoffSpecParseError::FeatureRequiresRegisterMode {

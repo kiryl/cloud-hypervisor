@@ -191,7 +191,7 @@ pub type MemoryZones = HashMap<String, MemoryZone>;
 ///
 /// `host_virt_addr` is the address in the *VMM's* address space that
 /// the kernel associates with the userfaultfd. The manager passes it
-/// back to the kernel in `UFFDIO_COPY` / `UFFDIO_WRITEPROTECT` /
+/// back to the kernel in `UFFDIO_COPY` / `UFFDIO_RWPROTECT` /
 /// `PAGEMAP_SCAN`; the kernel resolves it against the VMM's mm
 /// (because the uffd was created there), not the manager's.
 ///
@@ -1352,12 +1352,13 @@ impl MemoryManager {
     ///
     /// `mode` carries the parsed UFFD register modes and async
     /// features (validated by `UffdHandoffSpec::parse` at the API/config
-    /// boundary). Mode-combination validity is left to the kernel,
-    /// which surfaces `EINVAL` from
+    /// boundary). Mode-combination validity (e.g. WP and RWP cannot
+    /// coexist) is left to the kernel, which surfaces `EINVAL` from
     /// `UFFDIO_REGISTER`.
     ///
-    /// CH adds `UFFD_FEATURE_MISSING_{SHMEM,HUGETLBFS}` derived from
-    /// the memory backing when MISSING is requested.
+    /// CH always adds `UFFD_FEATURE_RWP` when RWP is requested, plus
+    /// `UFFD_FEATURE_MISSING_{SHMEM,HUGETLBFS}` derived from the
+    /// memory backing when MISSING is requested.
     ///
     /// Protocol on the handoff socket: one `sendmsg`, ancillary data
     /// carries the uffd, the body is a framed JSON `Handoff` message
@@ -1414,6 +1415,9 @@ impl MemoryManager {
         // Derive baseline UFFD_API features from the requested register
         // modes; OR in any async features the caller asked for.
         let mut required_features = mode.features;
+        if register_mode & userfaultfd::UFFDIO_REGISTER_MODE_RWP != 0 {
+            required_features |= userfaultfd::UFFD_FEATURE_RWP;
+        }
         if register_mode & userfaultfd::UFFDIO_REGISTER_MODE_MISSING != 0 {
             if self.shared {
                 required_features |= userfaultfd::UFFD_FEATURE_MISSING_SHMEM;
@@ -1587,7 +1591,7 @@ impl MemoryManager {
     /// Resume a uffd handoff after the external manager restarted.
     ///
     /// CH keeps its dup of the uffd for the VM's lifetime, so the
-    /// kernel-side registrations and WP markers survive a manager
+    /// kernel-side registrations and WP/RWP markers survive a manager
     /// crash, and while the manager is gone faulting vCPUs simply block
     /// — CH never resolves faults itself (no zero-fill, no data loss).
     /// On reconnect we re-send the *same* uffd fd plus the current
